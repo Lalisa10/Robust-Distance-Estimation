@@ -1,0 +1,17 @@
+%%writefile requirements.txt
+numpy
+librosa
+numba
+scipy
+tensorboard
+SoundFile
+einops
+joblib
+pesq
+mamba-ssm
+pyyaml
+gdown
+pytorch_lightning
+torchlibrosa
+wandb
+resampy
