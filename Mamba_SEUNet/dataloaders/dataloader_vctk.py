@@ -6,6 +6,8 @@ import torch.utils.data
 import librosa as lb
 from ..models.stfts import mag_phase_stft, mag_phase_istft
 from ..models.pcs400 import cal_pcs
+from ..utils.util import calculate_snr
+
 import numpy as np
 
 def list_files_in_directory(directory_path):
@@ -28,7 +30,7 @@ def get_clean_path_for_noisy(noisy_file_path, clean_path_dict):
     identifier = extract_identifier(noisy_file_path)
     return clean_path_dict.get(identifier, None)
 
-def adjust_array_length(self, arr, target_length, pad_value=None):
+def adjust_array_length(arr, target_length, pad_value=None):
     current_length = len(arr)
 
     if current_length > target_length:
@@ -60,7 +62,6 @@ def get_noisy_audio(clean_audio, noises_path, list_all_noises, snr, sr = 16000):
     audio_noise, _ = lb.load(os.path.join(noises_path, selected_noise_file), sr = sr, mono = True, res_type = "kaiser_fast")
 
     audio_noise = adjust_array_length(audio_noise, len(clean_audio), 0)
-    print("clean_audio.len", len(clean_audio))
 
     RMS_s = np.sqrt(np.mean(np.power(clean_audio,2)))
     if snr == "Random": # extractly randomly an SNR
@@ -144,13 +145,13 @@ class VCTKDemandDataset(torch.utils.data.Dataset):
         num_split = tensor.size(split_dim) // segment_size
         last_segment_size = tensor.size(split_dim) % segment_size
         assert(last_segment_size != 0)
-        #print("last_segment_size:", last_segment_size)
+        
         cutted_tensor = tensor.narrow(split_dim, 0, num_split * segment_size)
-        #print("cutted_tensor.shape", cutted_tensor.shape)
+        
         segments = list(torch.split(cutted_tensor, segment_size, dim=split_dim))
-        #print("len(segments)", len(segments))
+        
         last_segment = tensor.narrow(split_dim, tensor.size(split_dim) - segment_size, segment_size)
-        #print("last_segment.shape", last_segment.shape)
+        
         segments.append(last_segment)
         for i in range(len(segments)):
             segments[i] = segments[i].squeeze()

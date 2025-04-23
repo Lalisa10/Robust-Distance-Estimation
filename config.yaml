@@ -3,7 +3,7 @@
 # Adjust `num_gpus` and `dist_config` according to your distributed training environment.
 env_setting:
   num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
-  num_workers: 12  # Number of worker threads for data loading.
+  num_workers: 8  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
   stdout_interval: 200
   checkpoint_interval: 2000  # save model to ckpt every N steps
