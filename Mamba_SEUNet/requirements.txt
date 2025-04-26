@@ -7,7 +7,6 @@ SoundFile
 einops
 joblib
 pesq
-mamba-ssm
 pyyaml
 gdown
 pytorch_lightning
