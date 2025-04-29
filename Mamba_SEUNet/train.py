@@ -2,8 +2,11 @@
 # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
 
 import warnings
+import wandb
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import os
+import sys
+# Thêm thư mục 'audio-distance-estimation' vào sys.path
 import time
 import argparse
 import json
@@ -11,22 +14,21 @@ import yaml
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
-
-from dataloaders.dataloader_vctk import VCTKDemandDataset, Val_Dataset
-from models.stfts import mag_phase_stft, mag_phase_istft
-from models.generator import MambaSEUNet
-from models.loss import pesq_score, phase_losses
-from models.discriminator import MetricDiscriminator, batch_pesq
-from utils.util import (
+from Mamba_SEUNet.dataloaders.dataloader_vctk import VCTKDemandDataset
+from Mamba_SEUNet.models.stfts import mag_phase_stft, mag_phase_istft
+from Mamba_SEUNet.models.generator import MambaSEUNet
+from joint_model import JointModel
+from Mamba_SEUNet.models.loss import pesq_score, phase_losses
+from Mamba_SEUNet.models.discriminator import MetricDiscriminator, batch_pesq
+from audio_distance_estimation.model import SeldNet
+from Mamba_SEUNet.utils.util import (
     load_ckpts, load_optimizer_states, save_checkpoint,
-    build_env, load_config, initialize_seed, 
+    build_env, load_config, initialize_seed,
     print_gpu_info, log_model_info, initialize_process_group,
 )
-
 torch.backends.cudnn.benchmark = True
 
 def setup_optimizers(models, cfg):
@@ -51,40 +53,19 @@ def setup_schedulers(optimizers, cfg, last_epoch):
     return scheduler_g, scheduler_d
 
 
-def create_val_dataset(cfg, train=True, split=True, device='cuda:0'):
-    """Create dataset based on cfguration."""
-    clean_json = cfg['data_cfg']['train_clean_json'] if train else cfg['data_cfg']['valid_clean_json']
-    noisy_json = cfg['data_cfg']['train_noisy_json'] if train else cfg['data_cfg']['valid_noisy_json']
-    shuffle = (cfg['env_setting']['num_gpus'] <= 1) if train else False
-    pcs = cfg['training_cfg']['use_PCS400'] if train else False
-
-    return Val_Dataset(
-        clean_json=clean_json,
-        noisy_json=noisy_json,
-        sampling_rate=cfg['stft_cfg']['sampling_rate'],
-        segment_size=cfg['training_cfg']['segment_size'],
-        n_fft=cfg['stft_cfg']['n_fft'],
-        hop_size=cfg['stft_cfg']['hop_size'],
-        win_size=cfg['stft_cfg']['win_size'],
-        compress_factor=cfg['model_cfg']['compress_factor'],
-        split=split,
-        n_cache_reuse=0,
-        shuffle=shuffle,
-        device=device,
-        pcs=pcs
-    )
-
 
 def create_dataset(cfg, train=True, split=True, device='cuda:0'):
     """Create dataset based on cfguration."""
     clean_json = cfg['data_cfg']['train_clean_json'] if train else cfg['data_cfg']['valid_clean_json']
-    noisy_json = cfg['data_cfg']['train_noisy_json'] if train else cfg['data_cfg']['valid_noisy_json']
+    noises_path = cfg['data_cfg']['train_noises_path'] if train else cfg['data_cfg']['valid_noises_path']
     shuffle = (cfg['env_setting']['num_gpus'] <= 1) if train else False
     pcs = cfg['training_cfg']['use_PCS400'] if train else False
-    
+    snr = cfg['data_cfg']['snr']
+
     return VCTKDemandDataset(
         clean_json=clean_json,
-        noisy_json=noisy_json,
+        noises_path=noises_path,
+        snr=snr,
         sampling_rate=cfg['stft_cfg']['sampling_rate'],
         segment_size=cfg['training_cfg']['segment_size'],
         n_fft=cfg['stft_cfg']['n_fft'],
@@ -103,7 +84,7 @@ def create_dataloader(dataset, cfg, train=True):
     if cfg['env_setting']['num_gpus'] > 1:
         sampler = DistributedSampler(dataset)
         sampler.set_epoch(cfg['training_cfg']['training_epochs'])
-        batch_size = (cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']) if train else 1
+        batch_size = (cfg['training_cfg']['batch_size'] // max(1, cfg['env_setting']['num_gpus'])) if train else 1
     else:
         sampler = None
         batch_size = cfg['training_cfg']['batch_size'] if train else 1
@@ -112,7 +93,7 @@ def create_dataloader(dataset, cfg, train=True):
     return DataLoader(
         dataset,
         num_workers=num_workers,
-        shuffle=(sampler is None) and train,
+        shuffle=True,#(sampler is None) and train,
         sampler=sampler,
         batch_size=batch_size,
         pin_memory=True,
@@ -124,7 +105,8 @@ def train(rank, args, cfg):
     num_gpus = cfg['env_setting']['num_gpus']
     n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
     compress_factor = cfg['model_cfg']['compress_factor']
-    batch_size = cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']
+    batch_size = cfg['training_cfg']['batch_size'] // max(1,cfg['env_setting']['num_gpus'])
+    beta = cfg['training_cfg']['loss']['beta']
     if num_gpus >= 1:
         initialize_process_group(cfg, rank)
         device = torch.device('cuda:{:d}'.format(rank))
@@ -133,39 +115,69 @@ def train(rank, args, cfg):
 
     generator = MambaSEUNet(cfg).to(device)
     discriminator = MetricDiscriminator().to(device)
+    seld_net = SeldNet("freq", 2, "all", "onSpec").to(device)
 
-    if rank == 0:
-        log_model_info(rank, generator, args.exp_path)
+    joint_model = JointModel(generator, discriminator, seld_net, device, n_fft, hop_size, win_size, compress_factor, cfg['stft_cfg']['sampling_rate'], cfg['training_cfg']['segment_size'])
+    joint_model.to(device)
 
-    state_dict_g, state_dict_do, steps, last_epoch = load_ckpts(args, device)
-    if state_dict_g is not None:
-        generator.load_state_dict(state_dict_g['generator'], strict=False)
-        discriminator.load_state_dict(state_dict_do['discriminator'], strict=False)
+    if args.load_pretrained_se != 'None':
+        g_path = args.load_pretrained_se
+        do_path = args.load_pretrained_se.replace('g_', 'do_')
+        state_dict_g = torch.load(g_path, map_location=device)
+        state_dict_do = torch.load(do_path, map_location=device)
 
-    if num_gpus > 1 and torch.cuda.is_available():
-        generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
-        discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
+        if state_dict_g is not None and state_dict_do is not None:
+            print("Loading pretrained SE successfully!")
+            joint_model.generator.load_state_dict(state_dict_g['generator'], strict=False)
+            joint_model.discriminator.load_state_dict(state_dict_do['discriminator'], strict=False)
+            steps = 0
+            last_epoch = 0
+        else:
+            print("No pretrained SE found!")
+            steps = 0
+            last_epoch = 0
 
-    # Create optimizer and schedulers
-    optimizers = setup_optimizers((generator, discriminator), cfg)
-    load_optimizer_states(optimizers, state_dict_do)
-    optim_g, optim_d = optimizers
-    scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+        # Create optimizer and schedulers
+        optimizers = setup_optimizers((generator, discriminator), cfg)
+        load_optimizer_states(optimizers, state_dict_do)
+        optim_g, optim_d = optimizers
 
-    # Create trainset and train_loader
+        scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+    else:
+        #Continue training
+        print("Continue training")
+        state_dict_jm, steps, last_epoch = load_ckpts(args, device)
+        joint_model.load_state_dict(state_dict_jm['joint_model'], strict=False)
+        print("Load pretrained Joint Model successfully!")
+
+        if num_gpus > 1 and torch.cuda.is_available():
+            joint_model.generator = DistributedDataParallel(generator, device_ids=[rank]).to(device)
+            joint_model.discriminator = DistributedDataParallel(discriminator, device_ids=[rank]).to(device)
+        # Create optimizer and schedulers
+        optimizers = setup_optimizers((joint_model.generator, joint_model.discriminator), cfg)
+        load_optimizer_states(optimizers, state_dict_jm)
+        optim_g, optim_d = optimizers
+        scheduler_g, scheduler_d = setup_schedulers(optimizers, cfg, last_epoch)
+
+    optim_s = torch.optim.Adam(seld_net.parameters(), lr = 0.001)
+    scheduler_s = torch.optim.lr_scheduler.ReduceLROnPlateau(optim_s, verbose=True, patience = 5, factor = 0.2)
+    evaluate = torch.nn.L1Loss()
+    criterion = torch.nn.MSELoss()
+
+    # # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
     train_loader = create_dataloader(trainset, cfg, train=True)
-
-    # Create validset and validation_loader if rank is 0
+    #print(len(train_loader))
     if rank == 0:
-        validset = create_val_dataset(cfg, train=False, split=False, device=device)
-        validation_loader = create_dataloader(validset, cfg, train=False)
-        sw = SummaryWriter(os.path.join(args.exp_path, 'logs'))
+        validset = create_dataset(cfg, train=True, split=True, device=device)
+        validation_loader = create_dataloader(validset, cfg, train=True)
 
-    generator.train()
-    discriminator.train()
+    joint_model.train()
+    run_name = "Dump Joint Training"
+    wandb.init(project='Distance-Estimation-Mamba-SEUnet-QMULTIMIT-10s', name=run_name)
 
     best_pesq, best_pesq_step = 0.0, 0
+    best_mae, best_mae_step = 0.0, 0
     for epoch in range(max(0, last_epoch), cfg['training_cfg']['training_epochs']):
         if rank == 0:
             start = time.time()
@@ -174,255 +186,226 @@ def train(rank, args, cfg):
         for i, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
-            clean_audio, clean_mag, clean_pha, clean_com, noisy_mag, noisy_pha = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+            clean_audio, clean_audio_segments, clean_mag_segments, clean_pha_segments,\
+            clean_com_segments, noisy_mag_segments, noisy_pha_segments, norm_factor, true_dist = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+
+            #print("train noisy_mag.shape: ", noisy_mag.shape)
             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
-            clean_mag = torch.autograd.Variable(clean_mag.to(device, non_blocking=True))
-            clean_pha = torch.autograd.Variable(clean_pha.to(device, non_blocking=True))
-            clean_com = torch.autograd.Variable(clean_com.to(device, non_blocking=True))
-            noisy_mag = torch.autograd.Variable(noisy_mag.to(device, non_blocking=True))
-            noisy_pha = torch.autograd.Variable(noisy_pha.to(device, non_blocking=True))
+            clean_audio_segments = [torch.autograd.Variable(clean_audio_segments[i].to(device, non_blocking=True)) for i in range(len(clean_audio_segments))]
+            clean_mag_segments = [torch.autograd.Variable(clean_mag_segments[i].to(device, non_blocking=True)) for i in range(len(clean_mag_segments))]
+            clean_pha_segments = [torch.autograd.Variable(clean_pha_segments[i].to(device, non_blocking=True)) for i in range(len(clean_pha_segments))]
+            clean_com_segments = [torch.autograd.Variable(clean_com_segments[i].to(device, non_blocking=True)) for i in range(len(clean_com_segments))]
+            noisy_mag_segments = [torch.autograd.Variable(noisy_mag_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_mag_segments))]
+            noisy_pha_segments = [torch.autograd.Variable(noisy_pha_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_pha_segments))]
+
+            true_dist = torch.autograd.Variable(true_dist.to(device, non_blocking=True))
+            norm_factor = torch.autograd.Variable(true_dist.to(device, non_blocking=True))
             one_labels = torch.ones(batch_size).to(device, non_blocking=True)
 
-            mag_g, pha_g, com_g = generator(noisy_mag, noisy_pha)
-
-            audio_g = mag_phase_istft(mag_g, pha_g, n_fft, hop_size, win_size, compress_factor)
+            audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, time_dist, pred_dist \
+            = joint_model(noisy_mag_segments, noisy_pha_segments, norm_factor)
             audio_list_r, audio_list_g = list(clean_audio.cpu().numpy()), list(audio_g.detach().cpu().numpy())
             batch_pesq_score = batch_pesq(audio_list_r, audio_list_g, cfg)
 
-            # Discriminator
-            # ------------------------------------------------------- #
+
+    #         # Discriminator
+    #         # -------------------------------------------------------
             optim_d.zero_grad()
-            metric_r = discriminator(clean_mag, clean_mag)
-            metric_g = discriminator(clean_mag, mag_g.detach())
-            loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
-            
-            if batch_pesq_score is not None:
-                loss_disc_g = F.mse_loss(batch_pesq_score.to(device), metric_g.flatten())
-            else:
-                loss_disc_g = 0
-            
-            loss_disc_all = loss_disc_r + loss_disc_g
-            
+            loss_disc_all = 0.0
+
+            for clean_mag, mag_g in zip(clean_mag_segments, denoised_mag_segments):
+                metric_r = joint_model.discriminator(clean_mag, clean_mag)
+                metric_g = joint_model.discriminator(clean_mag, mag_g.detach())
+
+                loss_disc_r = F.mse_loss(one_labels, metric_r.flatten())
+
+
+                if batch_pesq_score is not None:
+                    loss_disc_g = F.mse_loss(batch_pesq_score.to(device), metric_g.flatten())
+                else:
+                    print("No batch pesq score!")
+                    loss_disc_g = 0
+
+                loss_disc_all += loss_disc_r + loss_disc_g
+
             loss_disc_all.backward()
             optim_d.step()
             # ------------------------------------------------------- #
-            
+
             # Generator
             # ------------------------------------------------------- #
             optim_g.zero_grad()
-
+            loss_gen_all = 0.0
             # Reference: https://github.com/yxlu-0102/MP-SENet/blob/main/train.py
-            # L2 Magnitude Loss
-            loss_mag = F.mse_loss(clean_mag, mag_g)
-            # Anti-wrapping Phase Loss
-            loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
-            loss_pha = loss_ip + loss_gd + loss_iaf
-            # L2 Complex Loss
-            loss_com = F.mse_loss(clean_com, com_g) * 2
-            # Time Loss
-            loss_time = F.l1_loss(clean_audio, audio_g)
-            # Metric Loss
-            metric_g = discriminator(clean_mag, mag_g)
-            loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
-            # Consistancy Loss
-            _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
-            loss_con = F.mse_loss(com_g, rec_com) * 2
+            for clean_mag, mag_g, clean_pha, pha_g, clean_com, com_g, clean_audio, audio_g in \
+             zip(clean_mag_segments, denoised_mag_segments, clean_pha_segments, denoised_pha_segments, \
+                 clean_com_segments, denoised_com_segments, clean_audio_segments, denoised_audio_segments):
+                # L2 Magnitude Loss
 
-            loss_gen_all = (
-                loss_metric * cfg['training_cfg']['loss']['metric'] +
-                loss_mag * cfg['training_cfg']['loss']['magnitude'] +
-                loss_pha * cfg['training_cfg']['loss']['phase'] +
-                loss_com * cfg['training_cfg']['loss']['complex'] +
-                loss_time * cfg['training_cfg']['loss']['time'] + 
-                loss_con * cfg['training_cfg']['loss']['consistancy']
-            )
+                loss_mag = F.mse_loss(clean_mag, mag_g)
 
-            loss_gen_all.backward()
-            optim_g.step()
+                # Anti-wrapping Phase Loss
+                loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
+                loss_pha = loss_ip + loss_gd + loss_iaf
+                # L2 Complex Loss
+
+                loss_com = F.mse_loss(clean_com, com_g) * 2
+                # Time Loss
+
+                loss_time = F.l1_loss(clean_audio, audio_g)
+                # Metric Loss
+                metric_g = joint_model.discriminator(clean_mag, mag_g)
+                #print("metric_g.shape", metric_g.shape)
+
+                loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
+                # Consistancy Loss
+                _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
+
+                loss_con = F.mse_loss(com_g, rec_com) * 2
+
+                loss_gen_all += (
+                    loss_metric * cfg['training_cfg']['loss']['metric'] +
+                    loss_mag * cfg['training_cfg']['loss']['magnitude'] +
+                    loss_pha * cfg['training_cfg']['loss']['phase'] +
+                    loss_com * cfg['training_cfg']['loss']['complex'] +
+                    loss_time * cfg['training_cfg']['loss']['time'] +
+                    loss_con * cfg['training_cfg']['loss']['consistancy']
+                )
+
             # ------------------------------------------------------- #
+
+            # seld_net
+            optim_s.zero_grad()
+
+            dist_loss = criterion(pred_dist, true_dist)
+            timewise_loss = criterion(torch.mean(time_dist, dim = -1), true_dist)
+            sde_loss = (dist_loss + timewise_loss)/2
+
+            #Backward Propargation
+            joint_loss = sde_loss * (1 - beta) + loss_gen_all * beta
+            joint_loss.backward()
+
+            optim_s.step()
+            optim_g.step()
+
+            scheduler_s.step(sde_loss)
 
             if rank == 0:
                 # STDOUT logging
                 if steps % cfg['env_setting']['stdout_interval'] == 0:
                     with torch.no_grad():
-                        metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                        mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
-                        pha_error = (loss_ip + loss_gd + loss_iaf).item()
-                        com_error = F.mse_loss(clean_com, com_g).item()
-                        time_error = F.l1_loss(clean_audio, audio_g).item()
-                        con_error = F.mse_loss( com_g, rec_com ).item()
+                        # print("metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()", metric_g.flatten().shape, one_labels.shape)
+                        # metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
+                        # mag_error = F.mse_loss(clean_mag, mag_g).item()
+                        # ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
+                        # pha_error = (loss_ip + loss_gd + loss_iaf).item()
+                        # com_error = F.mse_loss(clean_com, com_g).item()
+                        # time_error = F.l1_loss(clean_audio, audio_g).item()
+                        # # print("clean_audio.shape 2", clean_audio.shape);
+                        # # print("audio_g.shape 2", audio_g.shape)
+                        # con_error = F.mse_loss( com_g, rec_com ).item()
 
-                        print(
-                            'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
-                            )
-                        )
+                        # print(
+                        #     'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
+                        #     'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
+                        #         steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                        #     )
+                        # )
+                        print(f'SDE Loss: {sde_loss}, Joint Loss: {joint_loss}')
+
+                        wandb.log({"train/gen_loss:": loss_gen_all,
+                                   "train/disc_loss": loss_disc_all,
+                                   "train/sde_loss" : sde_loss,
+                                   "train/joint_loss": joint_loss})
 
                 # Checkpointing
                 if steps % cfg['env_setting']['checkpoint_interval'] == 0 and steps != 0:
-                    exp_name = f"{args.exp_path}/g_{steps:08d}.pth"
+                    exp_name = f"{args.exp_path}/jm_{steps:08d}.pth"
                     save_checkpoint(
                         exp_name,
                         {
-                            'generator': (generator.module if num_gpus > 1 else generator).state_dict()
-                        }
-                    )
-                    exp_name = f"{args.exp_path}/do_{steps:08d}.pth"
-                    save_checkpoint(
-                        exp_name,
-                        {
-                            'discriminator': (discriminator.module if num_gpus > 1 else discriminator).state_dict(),
+                            'joint_model': joint_model.state_dict(),
                             'optim_g': optim_g.state_dict(),
                             'optim_d': optim_d.state_dict(),
+                            'optim_s': optim_s.state_dict(),
                             'steps': steps,
                             'epoch': epoch
                         }
                     )
 
-                # Tensorboard summary logging
-                if steps % cfg['env_setting']['summary_interval'] == 0:
-                    sw.add_scalar("Training/Generator Loss", loss_gen_all, steps)
-                    sw.add_scalar("Training/Discriminator Loss", loss_disc_all, steps)
-                    sw.add_scalar("Training/Metric Loss", metric_error, steps)
-                    sw.add_scalar("Training/Magnitude Loss", mag_error, steps)
-                    sw.add_scalar("Training/Phase Loss", pha_error, steps)
-                    sw.add_scalar("Training/Complex Loss", com_error, steps)
-                    sw.add_scalar("Training/Time Loss", time_error, steps)
-                    sw.add_scalar("Training/Consistancy Loss", con_error, steps)
 
                 # If NaN happend in training period, RaiseError
                 if torch.isnan(loss_gen_all).any():
                     raise ValueError("NaN values found in loss_gen_all")
 
-                # Validation
-                if steps % cfg['env_setting']['validation_interval'] == 0 and steps != 0:
-                    generator.eval()
+                #Validation
+                if steps % cfg['env_setting']['validation_interval'] == 0:
+                    # Validation
+                    joint_model.eval()
                     torch.cuda.empty_cache()
                     audios_r, audios_g = [], []
                     val_mag_err_tot = 0
                     val_pha_err_tot = 0
                     val_com_err_tot = 0
                     with torch.no_grad():
+                        sum_loss = 0.0
+                        sum_loss_timewise = 0.0
+                        sum_sde_loss = 0.0
+                        mae = 0.0
                         for j, batch in enumerate(validation_loader):
-                            clean_audio, clean_mag, clean_pha, clean_com, noisy_audio = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
+                            clean_audio, clean_audio_segments, clean_mag_segments, clean_pha_segments,\
+                            clean_com_segments, noisy_mag_segments, noisy_pha_segments, norm_factor, labels = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
                             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
-                            clean_mag = torch.autograd.Variable(clean_mag.to(device, non_blocking=True))
-                            clean_pha = torch.autograd.Variable(clean_pha.to(device, non_blocking=True))
-                            clean_com = torch.autograd.Variable(clean_com.to(device, non_blocking=True))
-                            noisy_audio = torch.autograd.Variable(noisy_audio.to(device, non_blocking=True))
+                            clean_audio_segments = [torch.autograd.Variable(clean_audio_segments[i].to(device, non_blocking=True)) for i in range(len(clean_audio_segments))]
+                            clean_mag_segments = [torch.autograd.Variable(clean_mag_segments[i].to(device, non_blocking=True)) for i in range(len(clean_mag_segments))]
+                            clean_pha_segments = [torch.autograd.Variable(clean_pha_segments[i].to(device, non_blocking=True)) for i in range(len(clean_pha_segments))]
+                            clean_com_segments = [torch.autograd.Variable(clean_com_segments[i].to(device, non_blocking=True)) for i in range(len(clean_com_segments))]
+                            noisy_mag_segments = [torch.autograd.Variable(noisy_mag_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_mag_segments))]
+                            noisy_pha_segments = [torch.autograd.Variable(noisy_pha_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_pha_segments))]
+                            norm_factor = torch.autograd.Variable(norm_factor.to(device, non_blocking=True))
+                            labels = torch.autograd.Variable(labels.to(device, non_blocking = True))
 
-                            orig_size = noisy_audio.size(1)
+                            audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, distance_est, time_wise_distance \
+                    = joint_model(noisy_mag_segments, noisy_pha_segments, norm_factor)
 
-                            # 判断是否需要补零
-                            if noisy_audio.size(1) >= cfg['training_cfg']['segment_size']:
-                                num_segments = noisy_audio.size(1) // cfg['training_cfg']['segment_size']
-                                last_segment_size = noisy_audio.size(1) % cfg['training_cfg']['segment_size']
-                                if last_segment_size > 0:
-                                    last_segment = noisy_audio[:, -cfg['training_cfg']['segment_size']:]
-                                    noisy_audio = noisy_audio[:, :-last_segment_size]
-                                    segments = torch.split(noisy_audio, cfg['training_cfg']['segment_size'], dim=1)
-                                    segments = list(segments)
-                                    segments.append(last_segment)
-                                    reshapelast = 1
-                                else:
-                                    segments = torch.split(noisy_audio, cfg['training_cfg']['segment_size'], dim=1)
-                                    reshapelast = 0
+                            dist_loss = criterion(distance_est, labels)
+                            time_loss = criterion(torch.mean(time_wise_distance, dim = -1), labels)
+                            sde_loss = (dist_loss + time_loss) / 2
+                            mae += evaluate(distance_est, labels)
 
-                            else:
-                                # 如果语音长度小于一个segment_size，则直接补零
-                                padded_zeros = torch.zeros(1, cfg['training_cfg']['segment_size'] - noisy_audio.size(1)).to(device)
-                                noisy_audio = torch.cat((noisy_audio, padded_zeros), dim=1)
-                                segments = [noisy_audio]
-                                reshapelast = 0
+                            sum_loss += dist_loss
+                            sum_loss_timewise += time_loss
+                            sum_sde_loss += sde_loss
 
-                            # 处理每个语音切片并连接结果
-                            processed_segments = []
-                            audio_g = []
+                        sum_loss /= len(validation_loader)
+                        sum_loss_timewise /= len(validation_loader)
+                        sum_sde_loss /= len(validation_loader)
+                        mae /= len(validation_loader)
 
-                            for i, segment in enumerate(segments):
+                        scheduler_s.step(sum_sde_loss)
 
-                                noisy_amp, noisy_pha, noisy_com = mag_phase_stft(segment, n_fft, hop_size, win_size,
-                                                                               compress_factor)
-                                amp_g, pha_g, com_g = generator(noisy_amp.to(device, non_blocking=True),
-                                                                noisy_pha.to(device, non_blocking=True))
-                                audio_g = mag_phase_istft(amp_g, pha_g, n_fft, hop_size, win_size, compress_factor)
-
-                                audio_g = audio_g.squeeze()
-                                if reshapelast == 1 and i == len(segments) - 2:
-                                    audio_g = audio_g[:-(cfg['training_cfg']['segment_size'] - last_segment_size)]
-                                    # print(orig_size)
-
-                                processed_segments.append(audio_g)
-
-                            # 将所有处理后的片段连接成一个完整的语音
-
-                            processed_audio = torch.cat(processed_segments, dim=-1)
-
-                            # 裁切末尾部分，保留noisy_wav长度的部分
-                            audio_g = processed_audio[:orig_size]
-
-                            mag_g, pha_g, com_g = mag_phase_stft(audio_g, n_fft, hop_size, win_size,
-                                                               compress_factor)
-
-                            mag_g = torch.autograd.Variable(mag_g.to(device, non_blocking=True))
-                            pha_g = torch.autograd.Variable(pha_g.to(device, non_blocking=True))
-
-                            com_g = torch.autograd.Variable(com_g.to(device, non_blocking=True))
-
-                            mag_g = mag_g.squeeze()
-                            pha_g = torch.unsqueeze(pha_g, dim=0)
-
-                            # com_g = com_g.squeeze()
-                            clean_mag = clean_mag.squeeze()
-                            # clean_pha = clean_pha.squeeze()
-
-                            clean_com = clean_com.squeeze()
-                            audios_r += torch.split(clean_audio, 1, dim=0)  # [1, T] * B
-                            # print(clean_audio.size())
-                            # # print(len(audios_r))
-                            audio_g = torch.unsqueeze(audio_g, dim=0)
-                            audios_g += torch.split(audio_g, 1, dim=0)
-
-
-                            val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
-                            val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg)
-                            val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
-                            val_com_err_tot += F.mse_loss(clean_com, com_g).item()
-
-                        val_mag_err = val_mag_err_tot / (j+1)
-                        val_pha_err = val_pha_err_tot / (j+1)
-                        val_com_err = val_com_err_tot / (j+1)
-                        val_pesq_score = pesq_score(audios_r, audios_g, cfg).item()
-                        print('Steps : {:d}, PESQ Score: {:4.3f}, s/b : {:4.3f}'.
-                                format(steps, val_pesq_score, time.time() - start_b))
-                        sw.add_scalar("Validation/PESQ Score", val_pesq_score, steps)
-                        sw.add_scalar("Validation/Magnitude Loss", val_mag_err, steps)
-                        sw.add_scalar("Validation/Phase Loss", val_pha_err, steps)
-                        sw.add_scalar("Validation/Complex Loss", val_com_err, steps)
-
-                    generator.train()
-
-                    # Print best validation PESQ score in terminal
-                    if val_pesq_score >= best_pesq:
-                        best_pesq = val_pesq_score
-                        best_pesq_step = steps
-                    print(f"valid: PESQ {val_pesq_score}, Mag_loss {val_mag_err}, Phase_loss {val_pha_err}. Best_PESQ: {best_pesq} at step {best_pesq_step}")
-
+                        wandb.log({"val/loss": sum_loss})
+                        wandb.log({"val/loss_timewise": sum_loss_timewise})
+                        wandb.log({"val/sde_loss": sum_sde_loss})
+                        wandb.log({"val/mae": mae})
+                    print(f"Step {steps}: validation sde_loss: {sum_sde_loss}, validation mae: {mae}")
+                    joint_model.train()
             steps += 1
-
         scheduler_g.step()
         scheduler_d.step()
-        
+        if rank == 0:
+            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
+
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--exp_folder', default='exp')
-    parser.add_argument('--exp_name', default='MambaSEUNet_emb_32')
-    parser.add_argument('--config', default='recipes/Mamba-SEUNet/Mamba-SEUNet.yaml')
+    parser.add_argument('--exp_name', default='Mamba-SEUnet+SeldNet-10s')
+    parser.add_argument('--config', default='config.yaml')
+    parser.add_argument('--load_pretrained_se', default='None')
+
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -437,8 +420,7 @@ def main():
         )
         cfg['env_setting']['num_gpus'] = available_gpus
         num_gpus = available_gpus
-        time.sleep(5)
-        
+
 
     initialize_seed(seed)
     args.exp_path = os.path.join(args.exp_folder, args.exp_name)
@@ -458,3 +440,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

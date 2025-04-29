@@ -5,7 +5,7 @@ env_setting:
   num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 8  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
-  stdout_interval: 2000
+  stdout_interval: 200
   checkpoint_interval: 2000  # save model to ckpt every N steps
   validation_interval: 2000
   summary_interval: 2000
@@ -16,12 +16,12 @@ env_setting:
 
 # Datapath Configuratoin
 data_cfg:
-  train_clean_json: Mamba_SEUNet/data/train_clean.json
-  valid_clean_json: Mamba_SEUNet/data/valid_clean.json
-  test_clean_json: Mamba_SEUNet/data/test_clean.json
-  train_noises_path: data/subsample_wham_noise/tr
-  valid_noises_path: data/subsample_wham_noise/cv
-  test_noises_path: data/subsample_wham_noise/tt
+  train_clean_json: data/train_clean.json
+  valid_clean_json: data/valid_clean.json
+  test_clean_json: data/test_clean.json
+  train_noises_path: /content/drive/MyDrive/Datasets/noise_dataset/wham_noise/tr
+  valid_noises_path: /content/drive/MyDrive/Datasets/noise_dataset/wham_noise/cv
+  test_noises_path: /content/drive/MyDrive/Datasets/noise_dataset/wham_noise/tt
   snr: -10
 # Training Configuration
 # This section details parameters that directly influence the training process,

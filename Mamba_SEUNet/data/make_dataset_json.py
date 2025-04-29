@@ -33,21 +33,21 @@ def main():
     ## train_clean
     make_json(
         os.path.join(prepath, 'train'),
-        'Mamba_SEUNet/data/train_clean.json'
+        'data/train_clean.json'
     )
 
 
     ## valid_clean
     make_json(
          os.path.join(prepath, 'val/'),
-        'Mamba_SEUNet/data/valid_clean.json'
+        'data/valid_clean.json'
     )
 
 
     ## test_clean
     make_json(
        os.path.join(prepath, 'test/'),
-        'Mamba_SEUNet/data/test_clean.json'
+        'data/test_clean.json'
     )
 
     # ----------------------------------------------------------#
