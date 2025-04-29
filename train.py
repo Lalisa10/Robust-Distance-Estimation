@@ -93,7 +93,7 @@ def create_dataloader(dataset, cfg, train=True):
     return DataLoader(
         dataset,
         num_workers=num_workers,
-        shuffle=(sampler is None) and train,
+        shuffle=True,#(sampler is None) and train,
         sampler=sampler,
         batch_size=batch_size,
         pin_memory=True,
@@ -121,8 +121,8 @@ def train(rank, args, cfg):
     joint_model.to(device)
 
     if args.load_pretrained_se != 'None':
-        g_path = args.load_pretrain_se
-        do_path = args.load_pretrain_se.replace('g_', 'do_')
+        g_path = args.load_pretrained_se
+        do_path = args.load_pretrained_se.replace('g_', 'do_')
         state_dict_g = torch.load(g_path, map_location=device)
         state_dict_do = torch.load(do_path, map_location=device)
 
@@ -167,14 +167,14 @@ def train(rank, args, cfg):
     # # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
     train_loader = create_dataloader(trainset, cfg, train=True)
-    print(len(train_loader))
+    #print(len(train_loader))
     if rank == 0:
-        validset = create_dataset(cfg, train=False, split=True, device=device)
-        validation_loader = create_dataloader(validset, cfg, train=False)
+        validset = create_dataset(cfg, train=True, split=True, device=device)
+        validation_loader = create_dataloader(validset, cfg, train=True)
 
     joint_model.train()
     run_name = "Dump Joint Training"
-    wandb.init(project='Distance-Estimation-Mamba-SEUnet-QMULTIMIT-10s', name=run_name)
+    #wandb.init(project='Distance-Estimation-Mamba-SEUnet-QMULTIMIT-10s', name=run_name)
 
     best_pesq, best_pesq_step = 0.0, 0
     best_mae, best_mae_step = 0.0, 0
@@ -204,7 +204,6 @@ def train(rank, args, cfg):
 
             audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, time_dist, pred_dist \
             = joint_model(noisy_mag_segments, noisy_pha_segments, norm_factor)
-
             audio_list_r, audio_list_g = list(clean_audio.cpu().numpy()), list(audio_g.detach().cpu().numpy())
             batch_pesq_score = batch_pesq(audio_list_r, audio_list_g, cfg)
 
@@ -242,22 +241,26 @@ def train(rank, args, cfg):
              zip(clean_mag_segments, denoised_mag_segments, clean_pha_segments, denoised_pha_segments, \
                  clean_com_segments, denoised_com_segments, clean_audio_segments, denoised_audio_segments):
                 # L2 Magnitude Loss
+
                 loss_mag = F.mse_loss(clean_mag, mag_g)
 
                 # Anti-wrapping Phase Loss
                 loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
                 loss_pha = loss_ip + loss_gd + loss_iaf
                 # L2 Complex Loss
+
                 loss_com = F.mse_loss(clean_com, com_g) * 2
                 # Time Loss
-                print("clean_audio.shape", clean_audio.shape);
-                print("audio_g.shape", audio_g.shape);
+
                 loss_time = F.l1_loss(clean_audio, audio_g)
                 # Metric Loss
                 metric_g = joint_model.discriminator(clean_mag, mag_g)
+                #print("metric_g.shape", metric_g.shape)
+
                 loss_metric = F.mse_loss(metric_g.flatten(), one_labels)
                 # Consistancy Loss
                 _, _, rec_com = mag_phase_stft(audio_g, n_fft, hop_size, win_size, compress_factor, addeps=True)
+
                 loss_con = F.mse_loss(com_g, rec_com) * 2
 
                 loss_gen_all += (
@@ -273,6 +276,7 @@ def train(rank, args, cfg):
 
             # seld_net
             optim_s.zero_grad()
+
             dist_loss = criterion(pred_dist, true_dist)
             timewise_loss = criterion(torch.mean(time_dist, dim = -1), true_dist)
             sde_loss = (dist_loss + timewise_loss)/2
@@ -290,28 +294,29 @@ def train(rank, args, cfg):
                 # STDOUT logging
                 if steps % cfg['env_setting']['stdout_interval'] == 0:
                     with torch.no_grad():
-                        metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                        mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
-                        pha_error = (loss_ip + loss_gd + loss_iaf).item()
-                        com_error = F.mse_loss(clean_com, com_g).item()
-                        time_error = F.l1_loss(clean_audio, audio_g).item()
-                        print("clean_audio.shape 2", clean_audio.shape);
-                        print("audio_g.shape 2", audio_g.shape)
-                        con_error = F.mse_loss( com_g, rec_com ).item()
+                        # print("metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()", metric_g.flatten().shape, one_labels.shape)
+                        # metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
+                        # mag_error = F.mse_loss(clean_mag, mag_g).item()
+                        # ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
+                        # pha_error = (loss_ip + loss_gd + loss_iaf).item()
+                        # com_error = F.mse_loss(clean_com, com_g).item()
+                        # time_error = F.l1_loss(clean_audio, audio_g).item()
+                        # # print("clean_audio.shape 2", clean_audio.shape);
+                        # # print("audio_g.shape 2", audio_g.shape)
+                        # con_error = F.mse_loss( com_g, rec_com ).item()
 
-                        print(
-                            'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                            'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                                steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
-                            )
-                        )
+                        # print(
+                        #     'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
+                        #     'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
+                        #         steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
+                        #     )
+                        # )
                         print(f'SDE Loss: {sde_loss}, Joint Loss: {joint_loss}')
 
-                        wandb.log({"train/gen_loss:": loss_gen_all,
-                                   "train/disc_loss": loss_disc_all,
-                                   "train/sde_loss" : sde_loss,
-                                   "train/joint_loss": joint_loss})
+                        # wandb.log({"train/gen_loss:": loss_gen_all,
+                        #            "train/disc_loss": loss_disc_all,
+                        #            "train/sde_loss" : sde_loss,
+                        #            "train/joint_loss": joint_loss})
 
                 # Checkpointing
                 if steps % cfg['env_setting']['checkpoint_interval'] == 0 and steps != 0:
@@ -350,7 +355,6 @@ def train(rank, args, cfg):
                         for j, batch in enumerate(validation_loader):
                             clean_audio, clean_audio_segments, clean_mag_segments, clean_pha_segments,\
                             clean_com_segments, noisy_mag_segments, noisy_pha_segments, norm_factor, labels = batch # [B, 1, F, T], F = nfft // 2+ 1, T = nframes
-
                             clean_audio = torch.autograd.Variable(clean_audio.to(device, non_blocking=True))
                             clean_audio_segments = [torch.autograd.Variable(clean_audio_segments[i].to(device, non_blocking=True)) for i in range(len(clean_audio_segments))]
                             clean_mag_segments = [torch.autograd.Variable(clean_mag_segments[i].to(device, non_blocking=True)) for i in range(len(clean_mag_segments))]
@@ -358,8 +362,8 @@ def train(rank, args, cfg):
                             clean_com_segments = [torch.autograd.Variable(clean_com_segments[i].to(device, non_blocking=True)) for i in range(len(clean_com_segments))]
                             noisy_mag_segments = [torch.autograd.Variable(noisy_mag_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_mag_segments))]
                             noisy_pha_segments = [torch.autograd.Variable(noisy_pha_segments[i].to(device, non_blocking=True)) for i in range(len(noisy_pha_segments))]
-                            norm_factor = torch.autograd.Variable(true_dist.to(device, non_blocking=True))
-                            labels = labels.to(device, non_blocking = True)
+                            norm_factor = torch.autograd.Variable(norm_factor.to(device, non_blocking=True))
+                            labels = torch.autograd.Variable(labels.to(device, non_blocking = True))
 
                             audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, distance_est, time_wise_distance \
                     = joint_model(noisy_mag_segments, noisy_pha_segments, norm_factor)
@@ -380,11 +384,11 @@ def train(rank, args, cfg):
 
                         scheduler_s.step(sum_sde_loss)
 
-                        wandb.log({"val/loss": sum_loss})
-                        wandb.log({"val/loss_timewise": sum_loss_timewise})
-                        wandb.log({"val/sde_loss": sum_sde_loss})
-                        wandb.log({"val/mae": mae})
-
+                        # wandb.log({"val/loss": sum_loss})
+                        # wandb.log({"val/loss_timewise": sum_loss_timewise})
+                        # wandb.log({"val/sde_loss": sum_sde_loss})
+                        # wandb.log({"val/mae": mae})
+                    print(f"Step {steps}: validation sde_loss: {sum_sde_loss}, validation mae: {mae}")
                     joint_model.train()
             steps += 1
         scheduler_g.step()
@@ -400,7 +404,7 @@ def main():
     parser.add_argument('--exp_folder', default='exp')
     parser.add_argument('--exp_name', default='Mamba-SEUnet+SeldNet-10s')
     parser.add_argument('--config', default='config.yaml')
-    parser.add_argument('--load_pretrain_se', default='None')
+    parser.add_argument('--load_pretrained_se', default='None')
 
     args = parser.parse_args()
 
@@ -417,7 +421,6 @@ def main():
         cfg['env_setting']['num_gpus'] = available_gpus
         num_gpus = available_gpus
 
-    train(0, args, cfg)
 
     initialize_seed(seed)
     args.exp_path = os.path.join(args.exp_folder, args.exp_name)

@@ -194,7 +194,7 @@ class SeldNet(nn.Module):
         #print("fc2: ", x.shape)
         x = x.squeeze(2) # here [batch_size, time_bins]
         rnn = x
-        x = self.final(x).squeeze()
+        x = self.final(x).squeeze(1)
         #print("final: ", x.shape)
         if self.att_conf == "Nothing":
             return x, rnn, previous_magn.detach(), None

@@ -5,10 +5,10 @@ env_setting:
   num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 8  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
-  stdout_interval: 200
+  stdout_interval: 2000
   checkpoint_interval: 2000  # save model to ckpt every N steps
   validation_interval: 2000
-  summary_interval: 200
+  summary_interval: 2000
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
     dist_url: tcp://localhost:13407  # URL for initializing distributed training.
@@ -27,7 +27,7 @@ data_cfg:
 # This section details parameters that directly influence the training process,
 # including batch sizes, learning rates, and optimizer specifics.
 training_cfg:
-  training_epochs: 200 # Training epoch.
+  training_epochs: 50 # Training epoch.
   batch_size: 1  # Training batch size.
   learning_rate: 0.0005  # Initial learning rate.
   adam_b1: 0.8  # Beta1 hyperparameter for the AdamW optimizer.
@@ -55,9 +55,9 @@ stft_cfg:
 # Model Configuration
 # Defines the architecture specifics of the model, including layer configurations and feature compression.
 model_cfg:
-  hid_feature: 32  # Channels in dense layers.
+  hid_feature: 16  # Channels in dense layers.
   compress_factor: 0.3  # Compression factor applied to extracted features.
-  num_tfmamba: 4  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
+  num_tfmamba: 2  # Number of Time-Frequency Mamba (TFMamba) blocks in the model.
   d_state: 16 # Dimensionality of the state vector in Mamba blocks.
   d_conv: 4  # Convolutional layer dimensionality within Mamba blocks.
   expand: 4  # Expansion factor for the layers within the Mamba blocks.

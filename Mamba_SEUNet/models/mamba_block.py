@@ -1,5 +1,3 @@
-# Reference: https://github.com/RoyChao19477/SEMamba/models/mamba_block
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

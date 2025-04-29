@@ -5,7 +5,7 @@ import torch.nn as nn
 import numpy as np
 from pesq import pesq
 from joblib import Parallel, delayed
-from models.lsigmoid import LearnableSigmoid1D
+from .lsigmoid import LearnableSigmoid1D
 
 def pesq_loss(clean, noisy, sr=16000):
     try:
