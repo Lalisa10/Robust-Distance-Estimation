@@ -88,12 +88,12 @@ def create_dataloader(dataset, cfg, train=True):
     else:
         sampler = None
         batch_size = cfg['training_cfg']['batch_size'] if train else 1
-    num_workers = cfg['env_setting']['num_workers']
+    num_workers = cfg['env_setting']['num_workers'] if train else 0
 
     return DataLoader(
         dataset,
         num_workers=num_workers,
-        shuffle=True,#(sampler is None) and train,
+        shuffle=(sampler is None) and train,
         sampler=sampler,
         batch_size=batch_size,
         pin_memory=True,
@@ -169,15 +169,15 @@ def train(rank, args, cfg):
     train_loader = create_dataloader(trainset, cfg, train=True)
     #print(len(train_loader))
     if rank == 0:
-        validset = create_dataset(cfg, train=True, split=True, device=device)
-        validation_loader = create_dataloader(validset, cfg, train=True)
+        validset = create_dataset(cfg, train=False, split=True, device=device)
+        validation_loader = create_dataloader(validset, cfg, train=False)
 
     joint_model.train()
-    run_name = "Dump Joint Training"
-    #wandb.init(project='Distance-Estimation-Mamba-SEUnet-QMULTIMIT-10s', name=run_name)
+    run_name = "-10 dB QMULTIMIT"
+    wandb.init(project='Distance-Estimation-Mamba-SEUnet-QMULTIMIT-10s', name=run_name)
 
     best_pesq, best_pesq_step = 0.0, 0
-    best_mae, best_mae_step = 0.0, 0
+    best_mae, best_mae_step = 1000000.0, 0
     for epoch in range(max(0, last_epoch), cfg['training_cfg']['training_epochs']):
         if rank == 0:
             start = time.time()
@@ -294,29 +294,12 @@ def train(rank, args, cfg):
                 # STDOUT logging
                 if steps % cfg['env_setting']['stdout_interval'] == 0:
                     with torch.no_grad():
-                        # print("metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()", metric_g.flatten().shape, one_labels.shape)
-                        # metric_error = F.mse_loss(metric_g.flatten(), one_labels).item()
-                        # mag_error = F.mse_loss(clean_mag, mag_g).item()
-                        # ip_error, gd_error, iaf_error = phase_losses(clean_pha, pha_g, cfg)
-                        # pha_error = (loss_ip + loss_gd + loss_iaf).item()
-                        # com_error = F.mse_loss(clean_com, com_g).item()
-                        # time_error = F.l1_loss(clean_audio, audio_g).item()
-                        # # print("clean_audio.shape 2", clean_audio.shape);
-                        # # print("audio_g.shape 2", audio_g.shape)
-                        # con_error = F.mse_loss( com_g, rec_com ).item()
+                        print(f'Training at step {steps}:\tSDE Loss: {sde_loss:.4f}\tSE Loss: {loss_gen_all:.4f}\tJoint Loss: {joint_loss:.4f}\t')
 
-                        # print(
-                        #     'Steps : {:d}, Gen Loss: {:4.3f}, Disc Loss: {:4.3f}, Metric Loss: {:4.3f}, '
-                        #     'Mag Loss: {:4.3f}, Pha Loss: {:4.3f}, Com Loss: {:4.3f}, Time Loss: {:4.3f}, Cons Loss: {:4.3f}, s/b : {:4.3f}'.format(
-                        #         steps, loss_gen_all, loss_disc_all, metric_error, mag_error, pha_error, com_error, time_error, con_error, time.time() - start_b
-                        #     )
-                        # )
-                        print(f'SDE Loss: {sde_loss}, Joint Loss: {joint_loss}')
-
-                        # wandb.log({"train/gen_loss:": loss_gen_all,
-                        #            "train/disc_loss": loss_disc_all,
-                        #            "train/sde_loss" : sde_loss,
-                        #            "train/joint_loss": joint_loss})
+                        wandb.log({"train/gen_loss:": loss_gen_all,
+                                   "train/disc_loss": loss_disc_all,
+                                   "train/sde_loss" : sde_loss,
+                                   "train/joint_loss": joint_loss})
 
                 # Checkpointing
                 if steps % cfg['env_setting']['checkpoint_interval'] == 0 and steps != 0:
@@ -365,12 +348,14 @@ def train(rank, args, cfg):
                             norm_factor = torch.autograd.Variable(norm_factor.to(device, non_blocking=True))
                             labels = torch.autograd.Variable(labels.to(device, non_blocking = True))
 
-                            audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, distance_est, time_wise_distance \
+                            audio_g, denoised_audio_segments, denoised_mag_segments, denoised_pha_segments, denoised_com_segments, time_wise_distance, distance_est \
                     = joint_model(noisy_mag_segments, noisy_pha_segments, norm_factor)
+
 
                             dist_loss = criterion(distance_est, labels)
                             time_loss = criterion(torch.mean(time_wise_distance, dim = -1), labels)
                             sde_loss = (dist_loss + time_loss) / 2
+                            # print("mae += evaluate(distance_est, labels)", distance_est.shape, labels.shape)
                             mae += evaluate(distance_est, labels)
 
                             sum_loss += dist_loss
@@ -384,11 +369,14 @@ def train(rank, args, cfg):
 
                         scheduler_s.step(sum_sde_loss)
 
-                        # wandb.log({"val/loss": sum_loss})
-                        # wandb.log({"val/loss_timewise": sum_loss_timewise})
-                        # wandb.log({"val/sde_loss": sum_sde_loss})
-                        # wandb.log({"val/mae": mae})
-                    print(f"Step {steps}: validation sde_loss: {sum_sde_loss}, validation mae: {mae}")
+                        wandb.log({"val/loss": sum_loss})
+                        wandb.log({"val/loss_timewise": sum_loss_timewise})
+                        wandb.log({"val/sde_loss": sum_sde_loss})
+                        wandb.log({"val/mae": mae})
+                    if mae < best_mae:
+                        best_mae = mae
+                        best_mae_step = steps
+                    print(f"Validation step {steps}: validation sde_loss: {sum_sde_loss}, validation mae: {mae}, best mae: {best_mae} at {best_mae_step}")
                     joint_model.train()
             steps += 1
         scheduler_g.step()

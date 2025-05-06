@@ -5,10 +5,10 @@ env_setting:
   num_gpus: 1  # Number of GPUs. Now we don't support CPU mode.
   num_workers: 8  # Number of worker threads for data loading.
   seed: 1234  # Seed for random number generators to ensure reproducibility.
-  stdout_interval: 200
-  checkpoint_interval: 2000  # save model to ckpt every N steps
-  validation_interval: 2000
-  summary_interval: 2000
+  stdout_interval: 100
+  checkpoint_interval: 1000  # save model to ckpt every N steps
+  validation_interval: 1000
+  summary_interval: 1000
   dist_cfg:
     dist_backend: nccl  # Distributed training backend, 'nccl' for NVIDIA GPUs.
     dist_url: tcp://localhost:13407  # URL for initializing distributed training.

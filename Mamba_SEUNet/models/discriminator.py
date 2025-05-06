@@ -1,5 +1,4 @@
 # References: https://github.com/yxlu-0102/MP-SENet/blob/main/models/discriminator.py
-
 import torch
 import torch.nn as nn
 import numpy as np
@@ -17,8 +16,7 @@ def pesq_loss(clean, noisy, sr=16000):
 
 
 def batch_pesq(clean, noisy, cfg):
-    num_worker = cfg['env_setting']['num_workers']
-    pesq_score = Parallel(n_jobs=num_worker)(delayed(pesq_loss)(c, n) for c, n in zip(clean, noisy))
+    pesq_score = [pesq_loss(c, n) for c, n in zip(clean, noisy)]
     pesq_score = np.array(pesq_score)
     if -1 in pesq_score:
         return None

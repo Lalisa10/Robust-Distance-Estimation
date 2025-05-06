@@ -6,7 +6,6 @@ import torch.utils.data
 import librosa as lb
 from ..models.stfts import mag_phase_stft, mag_phase_istft
 from ..models.pcs400 import cal_pcs
-from ..utils.util import calculate_snr
 
 import numpy as np
 
